@@ -1,208 +1,171 @@
-# ProjectTekberKelompok3
-
+# ProjectTekberKelompok3 -- README
 OpenCV model for predict how many people in frame including their emotions and age.
 
-Proyek sederhana untuk **menghitung jumlah orang** berbasis deteksi wajah. Fitur **emosi** dan **umur** belum diimplementasikan, tetapi sudah disiapkan struktur foldernya agar tim yang menangani dapat langsung mengisi bagiannya.
+Proyek ini sekarang **hanya menghitung orang** pakai deteksi wajah OpenCV (Haar).
+Dua fitur berikut **belum diimplementasikan** dan jadi tugas tim kamu:
+
+* **Emosi** → folder: `src/emotions/`
+* **Umur** → folder: `src/ages/`
+
+Di bawah ini instruksi paling minimal supaya kamu bisa nambahin bagianmu tanpa utak-atik core.
 
 ---
 
-## 1) Struktur Proyek
-
-```
-face-mini/
-├─ requirements.txt
-└─ src/
-   ├─ main.py                # entrypoint: deteksi wajah + hitung orang
-   ├─ emotions/              # placeholder (belum diisi)
-   │  └─ __init__.py
-   └─ ages/                  # placeholder (belum diisi)
-      └─ __init__.py
-```
-
----
-
-## 2) Prasyarat
-
-* Python 3.9 atau lebih baru
-* Kamera (jika pakai webcam) atau file video (mp4/avi)
-* Pip/venv direkomendasikan
-
----
-
-## 3) Instalasi Cepat
+## Cara jalanin (untuk cek deteksi wajah)
 
 ```bash
-# opsional: buat virtual env
-python -m venv venv
-# Windows
-venv\Scripts\activate
-# macOS/Linux
-# source venv/bin/activate
-
 pip install -r requirements.txt
+python src/main.py --video 0          # webcam
+# atau:
+# python src/main.py --video path/to/video.mp4
 ```
 
-`requirements.txt` berisi:
+Opsi tuning cepat:
 
-```
-opencv-python
-mediapipe
-```
+* Banyak false positive: `--neigh 7`
+* Wajah kecil sering miss: `--scale 1.1 --min 16`
+* FPS turun: `--scale 1.3` atau kecilkan resolusi `--width 960 --height 540`
 
 ---
 
-## 4) Cara Menjalankan
+## Kontrak input untuk modul kalian (sama untuk Emosi & Umur)
 
-### Webcam
+Saat integrasi, `main.py` akan memberikan **list wajah grayscale** berukuran **64×64**:
 
-```bash
-python src/main.py --video 0
-```
+* Tipe: `numpy.ndarray` shape `(64, 64)` dtype `uint8` range `0..255`
+* Contoh pembuatan dari deteksi:
 
-### File Video
-
-```bash
-python src/main.py --video path/ke/video.mp4
-```
-
-### Opsi Berguna
-
-* Atur resolusi dan FPS:
-
-  ```bash
-  python src/main.py --video 0 --width 1280 --height 720 --fps 30
-  ```
-* Perketat atau longgarkan kepercayaan deteksi (default 0.55):
-
-  ```bash
-  python src/main.py --conf 0.65
+  ```python
+  face_crop = gray[y1:y2, x1:x2]              # gray dari frame
+  gray_64 = cv2.resize(face_crop, (64, 64))   # ini yang akan dikirim ke modul
   ```
 
-Tekan `ESC` untuk keluar.
+> Kamu bebas normalisasi sendiri di modul (misal bagi 255, atau z-score). Yang penting **terima list grayscale 64×64**.
 
 ---
 
-## 5) Apa yang Sudah Jalan
+## A. Tugas Tim Emosi (`src/emotions/`)
 
-* Deteksi wajah menggunakan MediaPipe
-* Hitung jumlah wajah pada frame saat ini
-* Tampilkan bounding box dan jumlah orang di overlay
+### Buat file: `src/emotions/inference.py`
 
-> Catatan: Hitung orang saat ini = jumlah wajah terdeteksi di frame itu. Belum ada tracking antar frame, karena scope proyek ini memang **count-only** yang ringan.
-
----
-
-## 6) Pembagian Tugas Tim
-
-Tim dibagi dua bagian yang **belum** diimplementasikan. Folder sudah disiapkan agar integrasi minimal:
-
-### A) Tim Emosi (`src/emotions/`)
-
-* **Target input**: crop wajah (nanti ditarik dari main loop).
-* **Format input yang disarankan**: grayscale 64×64 atau 112×112.
-* **Output**: `label_emosi (str)`, `confidence (float)`.
-* **Saran smoothing**: majority vote window (misal 7 frame) per ID jika kelak tracking ditambahkan.
-
-**Yang perlu disiapkan di folder `src/emotions/`:**
-
-1. `inference.py`
-
-   * Fungsi `load_model(...)`
-   * Fungsi `predict_emotions(list_of_gray_faces) -> List[(label, conf)]`
-2. `README.md` (opsional) yang jelaskan model, cara pakai, dan dependensi ekstra (kalau ada).
-
-**Contoh antarmuka yang akan dipanggil dari `main.py` nanti:**
+Implement 2 fungsi berikut:
 
 ```python
+# wajib ada
+def load_model(model_path: str | None = None):
+    """
+    Muat model/weight yang diperlukan.
+    Return: objek model (boleh apa saja) untuk dipakai di predict_emotions.
+    """
+    # TODO: load .pt atau inisialisasi model
+    return None
+
+# wajib ada
+def predict_emotions(gray_faces_64, model=None):
+    """
+    Param:
+      gray_faces_64: List[np.ndarray (64,64) uint8]
+      model: objek dari load_model()
+    Return:
+      List[Tuple[str, float]] -> [(label, confidence), ...] panjangnya = jumlah wajah
+    """
+    # TODO: preproc -> infer -> softmax -> mapping label
+    return [("neutral", 0.99) for _ in gray_faces_64]
+```
+
+### Output yang diharapkan
+
+* Contoh untuk 3 wajah:
+
+  ```python
+  [("happy", 0.92), ("neutral", 0.75), ("sad", 0.66)]
+  ```
+
+---
+
+## B. Tugas Tim Umur (`src/ages/`)
+
+### Buat file: `src/ages/inference.py`
+
+Implement 2 fungsi berikut:
+
+```python
+# wajib ada
+def load_model(model_path: str | None = None):
+    """
+    Muat model/weight umur.
+    """
+    return None
+
+# wajib ada
+def predict_ages(gray_faces_64, model=None):
+    """
+    Param:
+      gray_faces_64: List[np.ndarray (64,64) uint8]
+      model: objek dari load_model()
+    Return:
+      List[float|int] -> usia per wajah, panjang = jumlah wajah
+    """
+    # TODO: preproc -> infer -> postproc (clamp 1..90 jika perlu)
+    return [25.0 for _ in gray_faces_64]
+```
+
+### Output yang diharapkan
+
+* Contoh untuk 3 wajah:
+
+  ```python
+  [22.4, 37.0, 18.9]
+  ```
+
+---
+
+## Cara ngetes modul kalian sendiri (tanpa main loop)
+
+Bikin skrip kecil sementara (opsional), misal `scratch_emosi.py`:
+
+```python
+import cv2, numpy as np
 from emotions.inference import load_model, predict_emotions
-emo_model = load_model("path/opsional.pt")
-labels = predict_emotions(gray_faces_64)  # -> [("happy", 0.92), ...]
+
+img = cv2.imread("path/to/face.jpg", cv2.IMREAD_GRAYSCALE)
+gray_64 = cv2.resize(img, (64,64))
+model = load_model(None)
+print(predict_emotions([gray_64], model=model))
 ```
 
-### B) Tim Umur (`src/ages/`)
+Untuk umur, sama konsepnya pakai `ages.inference`.
 
-* **Target input**: crop wajah grayscale 64×64.
-* **Output**: `age (float atau int)` 1–90 (clamped).
-* **Saran smoothing**: Exponential Weighted Average (EWA) per ID jika tracking ditambahkan nanti.
+---
 
-**Yang perlu disiapkan di folder `src/ages/`:**
+## Integrasi nanti (biar tahu targetnya)
 
-1. `inference.py`
-
-   * Fungsi `load_model(...)`
-   * Fungsi `predict_ages(list_of_gray_faces) -> List[float]`
-2. `README.md` (opsional) model & dependensi.
-
-**Contoh antarmuka:**
+Setelah modul siap, `main.py` akan menambahkan kira-kira seperti ini:
 
 ```python
-from ages.inference import load_model, predict_ages
-age_model = load_model("path/opsional.pt")
-ages = predict_ages(gray_faces_64)  # -> [22.3, 35.7, ...]
+from emotions.inference import load_model as load_emo, predict_emotions
+from ages.inference import load_model as load_age, predict_ages
+
+emo_model = load_emo(None)
+age_model = load_age(None)
+
+# di loop, setelah dapat list gray_64:
+emo_out = predict_emotions(gray_faces_64, model=emo_model)
+age_out = predict_ages(gray_faces_64, model=age_model)
+
+# lalu overlay di masing-masing bbox
+label, conf = emo_out[i]
+age = age_out[i]
 ```
 
-> Kedua tim tidak perlu mengubah `main.py` pada tahap awal. Cukup pastikan fungsi antarmuka di atas tersedia. Integrasi akan dilakukan dengan menambahkan 5–10 baris kode di `main.py` saat waktunya.
+Kamu tidak perlu mengubah `main.py` sekarang. Cukup pastikan fungsi di modul kamu mengikuti kontrak di atas.
 
 ---
 
-## 7) Alur Data (Saat Ini)
+## Ringkas
 
-1. Baca frame dari kamera/file.
-2. Konversi BGR → RGB (MediaPipe butuh RGB).
-3. Deteksi wajah → daftar bounding box.
-4. Gambar kotak + tulis “People: N”.
-5. Tampilkan ke layar.
-
-> Emosi dan umur akan diinsert di langkah 4 setelah tim masing-masing siap.
-
----
-
-## 8) Kualitas & Performa
-
-Agar counting stabil:
-
-* **Confidence threshold**: default 0.55. Jika banyak false positive, naikkan ke 0.65. Jika sering miss, turunkan ke 0.45.
-* **Resolusi**: 1280×720 cukup. 1920×1080 menurunkan FPS.
-* **Exposure**: skrip mencoba menonaktifkan auto exposure/autofocus untuk stabilitas, tapi kemampuan ini tergantung driver kamera.
-
----
-
-## 9) Troubleshooting
-
-* **Window tidak muncul / crash saat buka kamera**
-
-  * Pastikan `--video 0` sesuai index kamera di perangkat kalian.
-  * Coba kurangi resolusi: `--width 640 --height 360`.
-
-* **FPS rendah**
-
-  * Kurangi resolusi.
-  * Tutup aplikasi berat lain yang memakai kamera/CPU.
-
-* **Tidak ada wajah terdeteksi**
-
-  * Tambahkan pencahayaan.
-  * Turunkan `--conf`.
-  * Pastikan wajah menghadap kamera dan tidak terlalu kecil di frame.
-
----
-
-## 10) Roadmap Integrasi Emosi & Umur (Ringkas)
-
-1. Tim Emosi dan Tim Umur menyelesaikan modul `inference.py` masing-masing.
-2. Tambahkan di `main.py`:
-
-   * Crop wajah → ubah ke grayscale → resize ke ukuran yang diminta modul.
-   * Panggil `predict_emotions` dan/atau `predict_ages`.
-   * Tampilkan label emosi dan prediksi umur di atas masing-masing bbox.
-3. (Opsional) Tambahkan tracker sederhana agar label tidak lompat-lompat dan bisa smoothing per ID.
-
----
-
-## 11) Lisensi
-
-Internal project. Silakan sesuaikan.
-
----
-
-Kalau butuh contoh potongan kode integrasi nanti, tinggal lihat antarmuka fungsi yang sudah ditentukan di bagian Pembagian Tugas Tim.
+* Input ke modul: **list grayscale 64×64**.
+* Emosi: kembalikan **(label, confidence)** per wajah.
+* Umur: kembalikan **angka umur** per wajah.
+* Sediakan `load_model()` dan `predict_*()` masing-masing.
+* Tes modulmu sendiri dulu; integrasi gampang begitu interface-nya konsisten.
