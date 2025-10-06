@@ -9,8 +9,6 @@ Dua fitur berikut **belum diimplementasikan** dan jadi tugas tim kamu:
 
 Di bawah ini instruksi paling minimal supaya kamu bisa nambahin bagianmu tanpa utak-atik core.
 
----
-
 ## Cara jalanin (untuk cek deteksi wajah)
 
 ```bash
@@ -26,8 +24,6 @@ Opsi tuning cepat:
 * Wajah kecil sering miss: `--scale 1.1 --min 16`
 * FPS turun: `--scale 1.3` atau kecilkan resolusi `--width 960 --height 540`
 
----
-
 ## Kontrak input untuk modul kalian (sama untuk Emosi & Umur)
 
 Saat integrasi, `main.py` akan memberikan **list wajah grayscale** berukuran **64×64**:
@@ -41,8 +37,6 @@ Saat integrasi, `main.py` akan memberikan **list wajah grayscale** berukuran **6
   ```
 
 > Kamu bebas normalisasi sendiri di modul (misal bagi 255, atau z-score). Yang penting **terima list grayscale 64×64**.
-
----
 
 ## A. Tugas Tim Emosi (`src/emotions/`)
 
@@ -81,8 +75,6 @@ def predict_emotions(gray_faces_64, model=None):
   [("happy", 0.92), ("neutral", 0.75), ("sad", 0.66)]
   ```
 
----
-
 ## B. Tugas Tim Umur (`src/ages/`)
 
 ### Buat file: `src/ages/inference.py`
@@ -118,8 +110,6 @@ def predict_ages(gray_faces_64, model=None):
   [22.4, 37.0, 18.9]
   ```
 
----
-
 ## Cara ngetes modul kalian sendiri (tanpa main loop)
 
 Bikin skrip kecil sementara (opsional), misal `scratch_emosi.py`:
@@ -135,8 +125,6 @@ print(predict_emotions([gray_64], model=model))
 ```
 
 Untuk umur, sama konsepnya pakai `ages.inference`.
-
----
 
 ## Integrasi nanti (biar tahu targetnya)
 
@@ -157,10 +145,6 @@ age_out = predict_ages(gray_faces_64, model=age_model)
 label, conf = emo_out[i]
 age = age_out[i]
 ```
-
-Kamu tidak perlu mengubah `main.py` sekarang. Cukup pastikan fungsi di modul kamu mengikuti kontrak di atas.
-
----
 
 ## Ringkas
 
