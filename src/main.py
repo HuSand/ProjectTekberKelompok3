@@ -15,35 +15,94 @@ from src.umur_model.umur_model import load_model as load_age_model, predict_ages
 from src.emosi_model.emosi_model import EmotionRecognizer
 
 # ================== CONFIG ==================
-VIDEO_SRC = 0
+VIDEO_SRC = 2
 FRAME_W, FRAME_H, FPS = 1280, 720, 30
 
 FACES_DIR       = "data/faces"
 FACE_SAVE_SIZE  = 64
 
-EMO_H5_PATH = "src/emosi_model/fer2013_cnn.h5"   # JSON tidak dipakai
+EMO_H5_PATH = "src/emosi_model/fer2013_cnn.h5"
 AGE_H5_PATH = "src/umur_model/age_model.h5"
 
-# Kotak & deteksi
-FACE_MARGIN     = 0.35    # lebih kecil dari sebelumnya (kurang latar)
-MIN_FACE_PX     = 120
-HAAR_SCALE      = 1.05     # lebih ketat biar stabil
+# Deteksi & kotak
+FACE_MARGIN     = 0.28
+BOX_SHRINK      = 0.90
+MIN_FACE_PX     = 110
+HAAR_SCALE      = 1.05
 HAAR_NEIGH      = 7
 HAAR_MIN_SIZE   = 36
 
 # Emosi
-EMO_UNKNOWN_TH  = 0.35     # di bawah ini tampil "Unknown"
+EMO_UNKNOWN_TH  = 0.35
 EMO_EMA_ALPHA   = 0.5
 
-# Umur (stabil)
-AGE_EMA_ALPHA   = 0.12     # lebih kalem
-AGE_ROUND_STEP  = 1.0      # bulatkan ke 1 tahun biar stabil
-AGE_MEDIAN_LEN  = 20       # ~0.7s @30fps
-AREA_DRIFT_GATE = 0.25     # skip update kalau bbox berubah >25%
+# Umur (stabilisasi)
+AGE_EMA_ALPHA   = 0.12
+AGE_ROUND_STEP  = 1.0
+AGE_MEDIAN_LEN  = 15
+AREA_DRIFT_GATE = 0.30  # skip update kalau bbox beda area >30%
+
+# Umur: quality gates
+BLUR_MIN_VAR        = 80.0
+BRIGHT_MIN          = 40.0
+BRIGHT_MAX          = 210.0
+CONTRAST_MIN_STD    = 20.0
+AGE_JUMP_MAX_ABS    = 8.0
+AGE_JUMP_MAX_RATIO  = 0.30
+
+# Range tampilan (biar gak ngawur)
+DISPLAY_MIN_AGE = 12.0
+DISPLAY_MAX_AGE = 75.0
+ADULT_MODE_MIN  = 16.0   # kalau model sering nembak bocil, dorong minimal ke sini
 # ============================================
+
+# ==== AGE SCALING (SATU-SATUNYA) ====
+AGE_TARGET = 22.0        # target mean umur default untuk kalibrasi awal
+AGE_SCALE_GLOBAL = None  # auto dari batch, lalu dipakai seed untuk tiap orang
 
 _eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
 _clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+
+
+class AgeCalibrator:
+    """Linear a*x + b, per-person. Pakai hotkeys 1/2/3/4/5 buat isi titik kalibrasi cepat."""
+    def __init__(self, l2=1e-3):
+        self.X = []  # raw_pred from model (sebelum scale per-ID)
+        self.Y = []  # true_age yang kamu input
+        self.a = 1.0
+        self.b = 0.0
+        self.l2 = l2
+
+    def add(self, raw_pred, true_age):
+        if raw_pred is None: return
+        self.X.append(float(raw_pred))
+        self.Y.append(float(true_age))
+        self._fit()
+
+    def _fit(self):
+        if len(self.X) < 2:
+            # fallback: skala kasar agar sekitar 22
+            m = np.mean(self.X) if self.X else 1.0
+            self.a = (22.0 / max(m,1e-6))
+            self.b = 0.0
+            return
+        X = np.array(self.X, dtype=float)
+        Y = np.array(self.Y, dtype=float)
+        Sx2 = float(np.dot(X, X)) + self.l2
+        Sx  = float(np.sum(X))
+        n   = float(len(X))
+        Sxy = float(np.dot(X, Y))
+        Sy  = float(np.sum(Y))
+        det = Sx2*n - Sx*Sx
+        if abs(det) < 1e-8:
+            self.a, self.b = 1.0, 0.0
+        else:
+            self.a = ( n*Sxy - Sx*Sy) / det
+            self.b = (Sx2*Sy - Sx*Sxy) / det
+
+    def apply(self, raw_pred):
+        if raw_pred is None: return None
+        return float(self.a*float(raw_pred) + self.b)
 
 def _square_with_margin(x1,y1,x2,y2,W,H,margin=FACE_MARGIN):
     w = x2 - x1; h = y2 - y1
@@ -58,8 +117,7 @@ def _square_with_margin(x1,y1,x2,y2,W,H,margin=FACE_MARGIN):
     y1n = max(0, y2n - s)
     return x1n, y1n, x2n, y2n
 
-def _shrink_box(x1,y1,x2,y2, factor=0.85):
-    # Perkecil kotak dari pusat supaya latar nggak kebawa
+def _shrink_box(x1,y1,x2,y2, factor=BOX_SHRINK):
     cx = (x1+x2)/2.0
     cy = (y1+y2)/2.0
     w  = (x2-x1)*factor
@@ -95,8 +153,7 @@ def crop_face_square(frame_bgr, box, do_align=True):
             frame_bgr = cv2.warpAffine(frame_bgr, M, (W,H),
                                        flags=cv2.INTER_LINEAR,
                                        borderMode=cv2.BORDER_REFLECT_101)
-    # shrink kotak supaya fokus ke wajah
-    x1,y1,x2,y2 = _shrink_box(x1,y1,x2,y2, factor=0.85)
+    x1,y1,x2,y2 = _shrink_box(x1,y1,x2,y2, factor=BOX_SHRINK)
     x1 = max(0,x1); y1=max(0,y1); x2=min(W,x2); y2=min(H,y2)
     face = frame_bgr[y1:y2, x1:x2]
     return face, (x1,y1,x2,y2)
@@ -127,6 +184,12 @@ class PersonState:
         self.emo_lbl = "Unknown"
         self.age_hist = deque(maxlen=AGE_MEDIAN_LEN)
         self.last_area = None
+        self.last_good_age = None      # umur valid terakhir
+        self.last_display_age = None   # umur yang ditampilkan terakhir
+        self.age_scale = None          # per-ID scale (seed dari global)
+        self.age_bias = 0.0
+        self.cal = AgeCalibrator()     # <<< kalibrator per-ID
+        self.last_raw_age = None       # simpan raw buat kalibrasi cepat
 
 def assign_ids(prev_states, boxes):
     assigned = []
@@ -134,19 +197,15 @@ def assign_ids(prev_states, boxes):
     for b in boxes:
         best_id = None; best_iou = 0.0
         for pid, st in prev_states.items():
-            if st.box is None or pid in used_prev:
-                continue
+            if st.box is None or pid in used_prev: continue
             ov = iou(st.box, b)
-            if ov > best_iou:
-                best_iou, best_id = ov, pid
+            if ov > best_iou: best_iou, best_id = ov, pid
         if best_id is not None and best_iou >= 0.25:
-            assigned.append((best_id, b))
-            used_prev.add(best_id)
+            assigned.append((best_id, b)); used_prev.add(best_id)
         else:
             new_id = max(prev_states.keys(), default=0) + 1
             prev_states[new_id] = PersonState()
-            assigned.append((new_id, b))
-            used_prev.add(new_id)
+            assigned.append((new_id, b)); used_prev.add(new_id)
     return assigned, prev_states
 
 def open_cam(src, w, h, fps):
@@ -164,8 +223,7 @@ def open_cam(src, w, h, fps):
 def build_detector(name="haarcascade_frontalface_default.xml"):
     path = cv2.data.haarcascades + name
     det = cv2.CascadeClassifier(path)
-    if det.empty():
-        raise RuntimeError(f"Gagal load cascade: {path}")
+    if det.empty(): raise RuntimeError(f"Gagal load cascade: {path}")
     return det
 
 def detect_faces_gray(detector, gray, scale=HAAR_SCALE, neigh=HAAR_NEIGH, min_size=HAAR_MIN_SIZE):
@@ -178,13 +236,62 @@ def detect_faces_gray(detector, gray, scale=HAAR_SCALE, neigh=HAAR_NEIGH, min_si
 def put_label_with_bg(img, text, org, font_scale=0.6, thickness=2):
     (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
     x, y = org
-    if y - th - 10 < 0:
-        y = y + th + 10
+    if y - th - 10 < 0: y = y + th + 10
     cv2.rectangle(img, (x, y - th - 6), (x + tw + 6, y + 2), (0,0,0), -1)
     cv2.putText(img, text, (x + 3, y - 6),
                 cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255,255,255), thickness)
 
+# ====== AGE QUALITY & OUTLIER HELPERS ======
+def _face_quality(g64):
+    blur = cv2.Laplacian(g64, cv2.CV_64F).var()
+    mean = float(np.mean(g64))
+    std  = float(np.std(g64))
+    ok = (blur >= BLUR_MIN_VAR) and (BRIGHT_MIN <= mean <= BRIGHT_MAX) and (std >= CONTRAST_MIN_STD)
+    return ok, blur, mean, std
+
+def _is_outlier_age(new_age, last_age):
+    if last_age is None: return False
+    jump_abs = abs(new_age - last_age)
+    jump_lim = max(AGE_JUMP_MAX_ABS, AGE_JUMP_MAX_RATIO * max(1.0, last_age))
+    return (jump_abs > jump_lim)
+
+# ====== AGE SCALING GLOBAL ======
+def auto_age_scale_from_batch(batch_vals, target=AGE_TARGET):
+    """Batch vals: list float output model (biasanya 0..1). Balik: scale float."""
+    arr = np.array([v for v in batch_vals if v is not None], dtype=float)
+    if arr.size == 0:
+        return None
+    m = float(np.mean(arr))
+    if m < 2.0:
+        scale = target / max(m, 1e-6)
+        scale = float(np.clip(scale, 25.0, 60.0))
+        return scale
+    elif m < 10.0:
+        return 10.0
+    else:
+        return 1.0
+
+def apply_scale_per_person(state: "PersonState", raw_age):
+    """Kalibrasi per-orang. Kalau scale belum ada, ambil dari global/auto."""
+    global AGE_SCALE_GLOBAL
+    if raw_age is None:
+        return None
+    if AGE_SCALE_GLOBAL is None:
+        AGE_SCALE_GLOBAL = 40.0  # fallback aman
+    if state.age_scale is None:
+        state.age_scale = AGE_SCALE_GLOBAL
+    # seed scale global -> kemudian dilembutkan lagi oleh calibrator (a*x+b)
+    base = float(raw_age) * state.age_scale + state.age_bias
+    # dorong minimum dewasa (sering kejadian model ngira bocil)
+    if base < ADULT_MODE_MIN:
+        base = ADULT_MODE_MIN + 0.3*(base - ADULT_MODE_MIN)  # tarik pelan
+    # clamp aman
+    base = float(np.clip(base, DISPLAY_MIN_AGE, DISPLAY_MAX_AGE))
+    return base
+
 def main():
+    global AGE_TARGET, AGE_SCALE_GLOBAL
+
     print(f"[CHECK] ada .h5 emosi? {Path(EMO_H5_PATH).exists()}")
     print(f"[CHECK] ada .h5 umur?  {Path(AGE_H5_PATH).exists()}")
 
@@ -194,7 +301,7 @@ def main():
 
     emo = None
     try:
-        emo = EmotionRecognizer(EMO_H5_PATH)  # rebuild+load_weights (di modul kamu)
+        emo = EmotionRecognizer(EMO_H5_PATH)
         print("[INFO] Model emosi OK (rebuild+load_weights)")
         _probe = emo.predict_emotion(np.full((48,48), 127, np.uint8))
         print(f"[INFO] Emo warmup: {_probe}")
@@ -205,88 +312,119 @@ def main():
 
     print(f"[INFO] Tekan 'S' untuk simpan wajah ke {outdir}")
     print("[INFO] Tekan 'ESC' untuk keluar")
+    print("[INFO] Hotkeys: '[' turunin target umur, ']' naikin target umur | 1=18y 2=20y 3=22y 4=25y 5=30y (kalibrasi wajah terbesar)")
 
     states = {}  # pid -> PersonState
+    active_pid = None  # id wajah terbesar (buat kalibrasi hotkey)
 
     while True:
         ok, frame = cap.read()
-        if not ok:
-            break
+        if not ok: break
 
         H, W = frame.shape[:2]
         gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         raw_boxes = detect_faces_gray(detector, gray_full, scale=HAAR_SCALE, neigh=HAAR_NEIGH, min_size=HAAR_MIN_SIZE)
 
-        # Crop square + align + filter min size + assign IDs
+        # Pilih yang terbesar jadi active_pid
+        largest_area = -1
+        largest_box  = None
+
+        # Crop + align + filter
         crops = []  # (pid, face_bgr, sq_box)
         id_boxes, states = assign_ids(states, raw_boxes)
         for (pid, b) in id_boxes:
             face_bgr, sq = crop_face_square(frame, b, do_align=True)
             sx1, sy1, sx2, sy2 = sq
             side = min(sx2 - sx1, sy2 - sy1)
-            if side < MIN_FACE_PX:
-                continue
+            if side < MIN_FACE_PX: continue
             states[pid].box = sq
             crops.append((pid, face_bgr, sq))
+            area = (sx2-sx1)*(sy2-sy1)
+            if area > largest_area:
+                largest_area = area
+                largest_box = (pid, sq)
 
-        # AGE batch
-        gray_faces_64 = []
+        active_pid = largest_box[0] if largest_box is not None else None
+
+        # AGE batch (CLAHE + resize ke 64)
+        gray_faces_pre = []
         for (_, face_bgr, _) in crops:
             g = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
-            gray_faces_64.append(g)
-        age_out = []
-        if gray_faces_64:
+            g = cv2.resize(g, (64,64), interpolation=cv2.INTER_AREA)
+            g = _clahe.apply(g)
+            gray_faces_pre.append(g)
+
+        age_raw_out = [None]*len(gray_faces_pre)
+        if gray_faces_pre:
             try:
-                age_out = predict_ages(gray_faces_64, model=age_model)
+                preds = predict_ages(gray_faces_pre, model=age_model)  # list of floats (RAW)
+                age_raw_out = [float(p) for p in preds]
             except Exception as e:
                 print("[AGE-ERR]", e)
-                age_out = [25.0]*len(gray_faces_64)
+                age_raw_out = [None]*len(gray_faces_pre)
 
-        # render
-        age_idx = 0
-        for (pid, face_bgr, sq) in crops:
+        # === UPDATE GLOBAL SCALE dari batch RAW ===
+        if age_raw_out:
+            cand = auto_age_scale_from_batch(age_raw_out, target=AGE_TARGET)
+            if cand is not None:
+                if AGE_SCALE_GLOBAL is None:
+                    AGE_SCALE_GLOBAL = cand
+                    print(f"[AGE] init global scale ×{AGE_SCALE_GLOBAL:.1f}")
+                else:
+                    AGE_SCALE_GLOBAL = 0.2 * cand + 0.8 * AGE_SCALE_GLOBAL
+
+        # ===== Render per-person =====
+        for idx, (pid, face_bgr, sq) in enumerate(crops):
             x1,y1,x2,y2 = sq
             cv2.rectangle(frame, (x1,y1), (x2,y2), (0,200,255), 2)
             st = states[pid]
             labels = []
 
-            # ===== AGE: median window -> EMA -> rounding =====
-            if age_idx < len(age_out):
-                a_raw = float(age_out[age_idx]); age_idx += 1
+            # ===== AGE: scale per-ID + calibrator + quality/outlier + median + EMA + rounding =====
+            a_disp = None
+            a_raw = age_raw_out[idx] if idx < len(age_raw_out) else None
+            st.last_raw_age = a_raw
 
-                # gate update kalau area berubah terlalu besar
+            if a_raw is not None:
+                # 1) global-seeded per-ID scaling (dorong minimal dewasa + clamp)
+                a_scaled = apply_scale_per_person(st, a_raw)
+                # 2) per-ID calibrator linear (a*x+b) — ini ngoreksi bias
+                a_cal = st.cal.apply(a_scaled)
+                # quality & stabilizer
+                g64 = gray_faces_pre[idx]
                 area = float((x2-x1)*(y2-y1))
-                stable = True
+                stable_area = True
                 if st.last_area is not None:
                     drift = abs(area - st.last_area) / (st.last_area + 1e-6)
-                    if drift > AREA_DRIFT_GATE:
-                        stable = False
+                    if drift > AREA_DRIFT_GATE: stable_area = False
                 st.last_area = area
 
-                if stable:
-                    st.age_hist.append(a_raw)
+                q_ok, blur, mean, std = _face_quality(g64)
+                use_update = stable_area and q_ok and (not _is_outlier_age(a_cal, st.last_good_age))
+                if use_update:
+                    st.age_hist.append(a_cal)
+                    st.last_good_age = a_cal
 
-                use_val = a_raw
+                base_val = st.last_good_age if st.last_good_age is not None else a_cal
+                med_val = base_val
                 if len(st.age_hist) >= max(5, AGE_MEDIAN_LEN//3):
-                    use_val = float(np.median(list(st.age_hist)))
+                    med_val = float(np.median(list(st.age_hist)))
 
-                a_smooth = st.age_ema.update(use_val)
-                a_smooth = round(a_smooth / AGE_ROUND_STEP) * AGE_ROUND_STEP
-                labels.append(f"Age: {a_smooth:.1f}y")
+                a_smooth = st.age_ema.update(med_val)
+                a_disp   = max(DISPLAY_MIN_AGE, min(DISPLAY_MAX_AGE, round(a_smooth / AGE_ROUND_STEP) * AGE_ROUND_STEP))
+                st.last_display_age = a_disp
+                labels.append(f"Age: {a_disp:.1f}y")
 
-            # ===== EMOTION: CLAHE + resize 48x48 + EMA confidence =====
+            # ===== EMOTION =====
             if emo is not None:
                 try:
                     emo_gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
                     emo_gray = cv2.resize(emo_gray, (48,48), interpolation=cv2.INTER_AREA)
                     emo_gray = _clahe.apply(emo_gray)
-                    lbl, conf = emo.predict_emotion(emo_gray)  # conf 0..1
+                    lbl, conf = emo.predict_emotion(emo_gray)
                     c_smooth = st.emo_conf_ema.update(float(conf))
-                    if c_smooth < EMO_UNKNOWN_TH:
-                        lbl_show = "Unknown"
-                    else:
-                        lbl_show = lbl
-                        st.emo_lbl = lbl
+                    lbl_show = lbl if c_smooth >= EMO_UNKNOWN_TH else "Unknown"
+                    if lbl_show != "Unknown": st.emo_lbl = lbl
                     labels.append(f"Emo: {lbl_show} {int(round(c_smooth*100))}%")
                 except Exception as e:
                     print(f"[EMO-ERR] {type(e).__name__}: {e}")
@@ -298,6 +436,10 @@ def main():
 
         cv2.putText(frame, f"People: {len(crops)}", (10,28),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2)
+
+        # info kalibrasi
+        if active_pid in states and states[active_pid].last_display_age is not None:
+            put_label_with_bg(frame, f"Active PID: {active_pid}  (kalibrasi: 1/2/3/4/5)", (10, H-10), font_scale=0.6, thickness=2)
 
         cv2.imshow("face-mini (Age+Emotion)", frame)
         k = cv2.waitKey(1) & 0xFF
@@ -311,6 +453,32 @@ def main():
                 g = cv2.resize(g, (FACE_SAVE_SIZE, FACE_SAVE_SIZE))
                 cv2.imwrite(str(outdir/f"face_{ts}_p{idx}.png"), g)
             print(f"[SAVED] {len(crops)} face(s) -> {outdir}")
+
+        # Hotkeys: kalibrasi target umur global
+        if k == ord('['):
+            AGE_TARGET = max(12.0, AGE_TARGET - 2.0)
+            print(f"[AGE] target -> {AGE_TARGET:.1f}")
+            AGE_SCALE_GLOBAL = None
+        if k == ord(']'):
+            AGE_TARGET = min(45.0, AGE_TARGET + 2.0)
+            print(f"[AGE] target -> {AGE_TARGET:.1f}")
+            AGE_SCALE_GLOBAL = None
+
+        # Hotkeys: kalibrasi per-orang (pakai wajah terbesar)
+        if active_pid in states:
+            st = states[active_pid]
+            rp = st.last_raw_age  # raw pred sebelum scaling
+            if rp is not None:
+                if k == ord('1'):
+                    st.cal.add(rp, 18.0); print("[CAL] PID", active_pid, "-> set 18y")
+                if k == ord('2'):
+                    st.cal.add(rp, 20.0); print("[CAL] PID", active_pid, "-> set 20y")
+                if k == ord('3'):
+                    st.cal.add(rp, 22.0); print("[CAL] PID", active_pid, "-> set 22y")
+                if k == ord('4'):
+                    st.cal.add(rp, 25.0); print("[CAL] PID", active_pid, "-> set 25y")
+                if k == ord('5'):
+                    st.cal.add(rp, 30.0); print("[CAL] PID", active_pid, "-> set 30y")
 
     cap.release()
     cv2.destroyAllWindows()
