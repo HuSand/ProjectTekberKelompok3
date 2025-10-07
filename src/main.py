@@ -2,6 +2,8 @@ import cv2
 import argparse
 from pathlib import Path
 import time
+from src.umur_model.umur_model import load_model as load_age_model, predict_ages
+
 
 def open_cam(src, w, h, fps):
     cap = cv2.VideoCapture(src)
@@ -69,6 +71,8 @@ def main():
     cap = open_cam(src, args.width, args.height, args.fps)
     detector = build_detector()
     outdir = Path(args.faces_dir)
+    age_model= load_age_model("src/umur_model/age_model.h5")
+
 
     print("[INFO] Tekan 'S' untuk simpan semua wajah (grayscale) ke", outdir)
     print("[INFO] Tekan 'ESC' untuk keluar")
