@@ -8,6 +8,7 @@ import cv2
 import time
 import math
 import numpy as np
+from collections import deque
 from pathlib import Path
 
 from src.umur_model.umur_model import load_model as load_age_model, predict_ages
@@ -23,13 +24,22 @@ FACE_SAVE_SIZE  = 64
 EMO_H5_PATH = "src/emosi_model/fer2013_cnn.h5"   # JSON tidak dipakai
 AGE_H5_PATH = "src/umur_model/age_model.h5"
 
-FACE_MARGIN     = 0.45
+# Kotak & deteksi
+FACE_MARGIN     = 0.35    # lebih kecil dari sebelumnya (kurang latar)
 MIN_FACE_PX     = 120
-EMO_UNKNOWN_TH  = 0.42     # sedikit dinaikkan biar gak gampang salah
-AGE_EMA_ALPHA   = 0.18     # lebih kalem biar tidak sensitif
-AGE_ROUND_STEP  = 0.5      # tampilkan umur dibulatkan ke 0.5 tahun
+HAAR_SCALE      = 1.05     # lebih ketat biar stabil
+HAAR_NEIGH      = 7
+HAAR_MIN_SIZE   = 36
 
+# Emosi
+EMO_UNKNOWN_TH  = 0.35     # di bawah ini tampil "Unknown"
+EMO_EMA_ALPHA   = 0.5
 
+# Umur (stabil)
+AGE_EMA_ALPHA   = 0.12     # lebih kalem
+AGE_ROUND_STEP  = 1.0      # bulatkan ke 1 tahun biar stabil
+AGE_MEDIAN_LEN  = 20       # ~0.7s @30fps
+AREA_DRIFT_GATE = 0.25     # skip update kalau bbox berubah >25%
 # ============================================
 
 _eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
@@ -48,11 +58,22 @@ def _square_with_margin(x1,y1,x2,y2,W,H,margin=FACE_MARGIN):
     y1n = max(0, y2n - s)
     return x1n, y1n, x2n, y2n
 
+def _shrink_box(x1,y1,x2,y2, factor=0.85):
+    # Perkecil kotak dari pusat supaya latar nggak kebawa
+    cx = (x1+x2)/2.0
+    cy = (y1+y2)/2.0
+    w  = (x2-x1)*factor
+    h  = (y2-y1)*factor
+    x1n = int(round(cx - w/2)); y1n = int(round(cy - h/2))
+    x2n = int(round(cx + w/2)); y2n = int(round(cy + h/2))
+    return x1n,y1n,x2n,y2n
+
 def _maybe_align_by_eyes(gray, roi):
     gx, gy, gw, gh = roi
     faceROI = gray[gy:gy+gh, gx:gx+gw]
-    eyes = _eye_cascade.detectMultiScale(faceROI, 1.12, 3,
-                                         minSize=(int(0.12*gw), int(0.12*gh)))
+    eyes = _eye_cascade.detectMultiScale(
+        faceROI, 1.12, 3, minSize=(int(0.12*gw), int(0.12*gh))
+    )
     if len(eyes) >= 2:
         eyes = sorted(eyes, key=lambda e: e[2]*e[3], reverse=True)[:2]
         (xA,yA,wA,hA), (xB,yB,wB,hB) = eyes
@@ -74,6 +95,9 @@ def crop_face_square(frame_bgr, box, do_align=True):
             frame_bgr = cv2.warpAffine(frame_bgr, M, (W,H),
                                        flags=cv2.INTER_LINEAR,
                                        borderMode=cv2.BORDER_REFLECT_101)
+    # shrink kotak supaya fokus ke wajah
+    x1,y1,x2,y2 = _shrink_box(x1,y1,x2,y2, factor=0.85)
+    x1 = max(0,x1); y1=max(0,y1); x2=min(W,x2); y2=min(H,y2)
     face = frame_bgr[y1:y2, x1:x2]
     return face, (x1,y1,x2,y2)
 
@@ -99,9 +123,10 @@ class PersonState:
     def __init__(self):
         self.box = None
         self.age_ema = EMA(alpha=AGE_EMA_ALPHA)
+        self.emo_conf_ema = EMA(alpha=EMO_EMA_ALPHA)
         self.emo_lbl = "Unknown"
-        self.emo_conf_ema = EMA(alpha=0.5)
-
+        self.age_hist = deque(maxlen=AGE_MEDIAN_LEN)
+        self.last_area = None
 
 def assign_ids(prev_states, boxes):
     assigned = []
@@ -143,7 +168,7 @@ def build_detector(name="haarcascade_frontalface_default.xml"):
         raise RuntimeError(f"Gagal load cascade: {path}")
     return det
 
-def detect_faces_gray(detector, gray, scale=1.08, neigh=6, min_size=36):
+def detect_faces_gray(detector, gray, scale=HAAR_SCALE, neigh=HAAR_NEIGH, min_size=HAAR_MIN_SIZE):
     eq = cv2.equalizeHist(gray)
     faces = detector.detectMultiScale(eq, scaleFactor=scale, minNeighbors=neigh,
                                       flags=cv2.CASCADE_SCALE_IMAGE,
@@ -161,7 +186,7 @@ def put_label_with_bg(img, text, org, font_scale=0.6, thickness=2):
 
 def main():
     print(f"[CHECK] ada .h5 emosi? {Path(EMO_H5_PATH).exists()}")
-    print(f"[CHECK] ada .h5 umur? {Path(AGE_H5_PATH).exists()}")
+    print(f"[CHECK] ada .h5 umur?  {Path(AGE_H5_PATH).exists()}")
 
     cap = open_cam(VIDEO_SRC, FRAME_W, FRAME_H, FPS)
     detector = build_detector()
@@ -169,8 +194,10 @@ def main():
 
     emo = None
     try:
-        emo = EmotionRecognizer(EMO_H5_PATH)  # rebuild + load_weights
+        emo = EmotionRecognizer(EMO_H5_PATH)  # rebuild+load_weights (di modul kamu)
         print("[INFO] Model emosi OK (rebuild+load_weights)")
+        _probe = emo.predict_emotion(np.full((48,48), 127, np.uint8))
+        print(f"[INFO] Emo warmup: {_probe}")
     except Exception as e:
         print(f"[WARN] Emosi load gagal: {e}")
 
@@ -188,7 +215,7 @@ def main():
 
         H, W = frame.shape[:2]
         gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        raw_boxes = detect_faces_gray(detector, gray_full, scale=1.08, neigh=6, min_size=36)
+        raw_boxes = detect_faces_gray(detector, gray_full, scale=HAAR_SCALE, neigh=HAAR_NEIGH, min_size=HAAR_MIN_SIZE)
 
         # Crop square + align + filter min size + assign IDs
         crops = []  # (pid, face_bgr, sq_box)
@@ -204,12 +231,9 @@ def main():
 
         # AGE batch
         gray_faces_64 = []
-        id_order = []
-        for (pid, face_bgr, sq) in crops:
+        for (_, face_bgr, _) in crops:
             g = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
-            gray_faces_64.append(g)  # predict_ages akan resize sendiri (64x64, 0..1)
-            id_order.append(pid)
-
+            gray_faces_64.append(g)
         age_out = []
         if gray_faces_64:
             try:
@@ -218,36 +242,57 @@ def main():
                 print("[AGE-ERR]", e)
                 age_out = [25.0]*len(gray_faces_64)
 
-        # Tulis hasil
-        idx_age = 0
+        # render
+        age_idx = 0
         for (pid, face_bgr, sq) in crops:
             x1,y1,x2,y2 = sq
             cv2.rectangle(frame, (x1,y1), (x2,y2), (0,200,255), 2)
-
-            st = states.get(pid, None)
+            st = states[pid]
             labels = []
 
-            # AGE smoothing
-            age_val = None
-            if idx_age < len(age_out):
-                age_val = float(age_out[idx_age]); idx_age += 1
-            if st and age_val is not None:
-                age_val = st.age_ema.update(age_val)
-                # round to nearest 0.5
-                age_val = round(age_val / AGE_ROUND_STEP) * AGE_ROUND_STEP
-                labels.append(f"Age: {age_val:.1f}y")
+            # ===== AGE: median window -> EMA -> rounding =====
+            if age_idx < len(age_out):
+                a_raw = float(age_out[age_idx]); age_idx += 1
 
+                # gate update kalau area berubah terlalu besar
+                area = float((x2-x1)*(y2-y1))
+                stable = True
+                if st.last_area is not None:
+                    drift = abs(area - st.last_area) / (st.last_area + 1e-6)
+                    if drift > AREA_DRIFT_GATE:
+                        stable = False
+                st.last_area = area
 
-            # EMO + smoothing + threshold Unknown
-            if emo is not None and st is not None:
+                if stable:
+                    st.age_hist.append(a_raw)
+
+                use_val = a_raw
+                if len(st.age_hist) >= max(5, AGE_MEDIAN_LEN//3):
+                    use_val = float(np.median(list(st.age_hist)))
+
+                a_smooth = st.age_ema.update(use_val)
+                a_smooth = round(a_smooth / AGE_ROUND_STEP) * AGE_ROUND_STEP
+                labels.append(f"Age: {a_smooth:.1f}y")
+
+            # ===== EMOTION: CLAHE + resize 48x48 + EMA confidence =====
+            if emo is not None:
                 try:
-                    emo_lbl, emo_p = emo.predict_emotion(face_bgr, unknown_threshold=EMO_UNKNOWN_TH)
-                    st.emo_lbl = emo_lbl
-                    emo_p = st.emo_conf_ema.update(emo_p)
-                    labels.append(f"Emo: {st.emo_lbl} {emo_p*100:.0f}%")
-                except Exception:
+                    emo_gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
+                    emo_gray = cv2.resize(emo_gray, (48,48), interpolation=cv2.INTER_AREA)
+                    emo_gray = _clahe.apply(emo_gray)
+                    lbl, conf = emo.predict_emotion(emo_gray)  # conf 0..1
+                    c_smooth = st.emo_conf_ema.update(float(conf))
+                    if c_smooth < EMO_UNKNOWN_TH:
+                        lbl_show = "Unknown"
+                    else:
+                        lbl_show = lbl
+                        st.emo_lbl = lbl
+                    labels.append(f"Emo: {lbl_show} {int(round(c_smooth*100))}%")
+                except Exception as e:
+                    print(f"[EMO-ERR] {type(e).__name__}: {e}")
                     labels.append("Emo: N/A")
 
+            # tulis stacked
             for j, t in enumerate(labels):
                 put_label_with_bg(frame, t, (x1, y1 + 20*j))
 
